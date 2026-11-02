@@ -139,7 +139,7 @@ private enum SessionKernelFailure: Error, Equatable { case storage, callback }
         }
         var jobs: [Task<Void, any Error>] = []
         for index in 0..<20 {
-            let job = Task {
+            let job = Task { @Sendable in
                 try await harness.session.commit({ tx in
                     let count = active.withLock { $0 += 1; return $0 }
                     maximumActive.withLock { $0 = max($0, count) }
