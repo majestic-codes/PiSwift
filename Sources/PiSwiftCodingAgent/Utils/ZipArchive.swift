@@ -38,8 +38,13 @@ public func createZipArchive(_ entries: [ZipEntry], date: Date = Date()) throws 
     var central = Data()
     let calendar = Calendar.current
     let parts = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
-    let time = UInt16(((parts.hour ?? 0) << 11) | ((parts.minute ?? 0) << 5) | ((parts.second ?? 0) >> 1))
-    let day = UInt16(((max(1980, parts.year ?? 1980) - 1980) << 9) | ((parts.month ?? 1) << 5) | (parts.day ?? 1))
+    let hourBits = (parts.hour ?? 0) << 11
+    let minuteBits = (parts.minute ?? 0) << 5
+    let secondBits = (parts.second ?? 0) >> 1
+    let time = UInt16(hourBits | minuteBits | secondBits)
+    let yearBits = (max(1980, parts.year ?? 1980) - 1980) << 9
+    let monthBits = (parts.month ?? 1) << 5
+    let day = UInt16(yearBits | monthBits | (parts.day ?? 1))
     for entry in entries {
         guard !entry.name.isEmpty, !entry.name.hasPrefix("/"), !entry.name.split(separator: "/").contains("..") else { throw ZipArchiveError.invalidEntry }
         let name = Data(entry.name.utf8)
