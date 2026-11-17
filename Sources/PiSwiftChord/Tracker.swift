@@ -288,7 +288,7 @@ private final class DraftContext: Sendable {
         self.lock = Mutex(DraftState(base: base, nodes: [DraftNode(base)]))
     }
     // The lifetime lock must be acquired before the change lock.
-    func withAccess<Result: Sendable>(_ body: (inout sending DraftState) throws -> Result) throws -> Result {
+    func withAccess<Result: Sendable>(_ body: @Sendable (inout DraftState) throws -> Result) throws -> Result {
         if let lifetime {
             return try lifetime.withAccess { try lock.withLock { draft in try body(&draft) } }
         }
