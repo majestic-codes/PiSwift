@@ -12,7 +12,7 @@ import Network
 final class OAuthLoopbackSocket {
     private static let queue = DispatchQueue(label: "pi.oauth.callback.loopback", attributes: .concurrent)
     private static let requestLimit = 64 * 1024
-    /// Seconds a connection has for its request: for each of its parts, and for all of them together.
+    /// Seconds a connection has for its whole request, and for each send of its response.
     private static let patience = 5
     /// Connections that send their request at the same time. Each one keeps a thread of the queue.
     private static let connectionLimit = 8
@@ -20,13 +20,54 @@ final class OAuthLoopbackSocket {
     private static let lineEnd = Data("\r\n".utf8)
 
     private let source: any DispatchSourceRead
+    private let connections: Connections
 
-    private init(source: any DispatchSourceRead) {
+    private init(source: any DispatchSourceRead, connections: Connections) {
         self.source = source
+        self.connections = connections
     }
 
-    // The cancel handler of the source closes the listening socket.
-    deinit { source.cancel() }
+    // The cancel handler of the source closes the listening socket. The accepted connections end with it,
+    // also the ones whose response waits for the token exchange.
+    deinit {
+        source.cancel()
+        connections.shutDown()
+    }
+
+    /// The accepted connections that are not closed yet.
+    private final class Connections: Sendable {
+        private struct State {
+            var isShutDown = false
+            var open: Set<Int32> = []
+        }
+
+        private let state = LockedState(State())
+
+        /// Keep the connection until its owner closes it. False when the socket is closed already.
+        func add(_ connection: Int32) -> Bool {
+            state.withLock { state in
+                if state.isShutDown { return false }
+                state.open.insert(connection)
+                return true
+            }
+        }
+
+        /// Close the connection. Only its owner calls this, once.
+        func close(_ connection: Int32) {
+            // Removed first, so `shutDown` never reaches the number after another socket gets it.
+            state.withLock { _ = $0.open.remove(connection) }
+            Darwin.close(connection)
+        }
+
+        /// End every open connection and admit no new one. The descriptors stay with their owners, who
+        /// close them: their reads and writes fail now.
+        func shutDown() {
+            state.withLock { state in
+                state.isShutDown = true
+                for connection in state.open { Darwin.shutdown(connection, SHUT_RDWR) }
+            }
+        }
+    }
 
     /// Listen on the port and pass each request line to `onRequest` with the peer that waits for the response.
     /// Return nil when the system has no IPv6 loopback address: nothing else can listen there either.
@@ -54,9 +95,14 @@ final class OAuthLoopbackSocket {
         }
         let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
         let reading = LockedState(0)
+        let connections = Connections()
         source.setEventHandler {
             let connection = accept(descriptor, nil, nil)
             guard connection >= 0 else { return }
+            guard connections.add(connection) else {
+                close(connection)
+                return
+            }
             // A local process that opens many connections must not take every thread of the process.
             let admitted = reading.withLock { count in
                 if count >= connectionLimit { return false }
@@ -64,16 +110,16 @@ final class OAuthLoopbackSocket {
                 return true
             }
             guard admitted else {
-                close(connection)
+                connections.close(connection)
                 return
             }
             queue.async {
-                serve(connection, onRequest: onRequest) { reading.withLock { $0 -= 1 } }
+                serve(connection, connections: connections, onRequest: onRequest) { reading.withLock { $0 -= 1 } }
             }
         }
         source.setCancelHandler { close(descriptor) }
         source.resume()
-        return OAuthLoopbackSocket(source: source)
+        return OAuthLoopbackSocket(source: source, connections: connections)
     }
 
     private static func bindToLoopback(_ descriptor: Int32, port: UInt16) -> Int32 {
@@ -94,12 +140,13 @@ final class OAuthLoopbackSocket {
 
     /// Read the request of the connection and pass it on. `requestRead` runs when the reading ends.
     private static func serve(
-        _ connection: Int32, onRequest: @Sendable (String, OAuthCallbackPeer) -> Void, requestRead: () -> Void
+        _ connection: Int32, connections: Connections,
+        onRequest: @Sendable (String, OAuthCallbackPeer) -> Void, requestRead: () -> Void
     ) {
         let line = prepare(connection) ? requestLine(of: connection) : nil
         requestRead()
         guard let line else {
-            close(connection)
+            connections.close(connection)
             return
         }
         // A second response must not close the descriptor again: another socket can have its number by then.
@@ -109,15 +156,15 @@ final class OAuthLoopbackSocket {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 queue.async {
                     write(response, to: connection)
-                    close(connection)
+                    connections.close(connection)
                     continuation.resume()
                 }
             }
         })
     }
 
-    /// Make the connection block for its bytes for at most five seconds, and fail without SIGPIPE when
-    /// the other side is gone.
+    /// Make the connection block for its bytes, give each send of the response five seconds at most, and
+    /// fail without SIGPIPE when the other side is gone. `requestLine` limits each receive.
     private static func prepare(_ connection: Int32) -> Bool {
         var enabled: Int32 = 1
         var patience = timeval(tv_sec: Self.patience, tv_usec: 0)
@@ -125,7 +172,6 @@ final class OAuthLoopbackSocket {
         let patienceSize = socklen_t(MemoryLayout<timeval>.size)
         return fcntl(connection, F_SETFL, 0) == 0
             && setsockopt(connection, SOL_SOCKET, SO_NOSIGPIPE, &enabled, enabledSize) == 0
-            && setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO, &patience, patienceSize) == 0
             && setsockopt(connection, SOL_SOCKET, SO_SNDTIMEO, &patience, patienceSize) == 0
     }
 
@@ -137,13 +183,24 @@ final class OAuthLoopbackSocket {
         var request = Data()
         let deadline = ContinuousClock.now + .seconds(patience)
         while request.range(of: headersEnd) == nil {
-            guard request.count < requestLimit, ContinuousClock.now < deadline else { return nil }
+            guard request.count < requestLimit, limitReceive(of: connection, to: deadline) else { return nil }
             let count = recv(connection, &buffer, buffer.count, 0)
-            guard count > 0 else { return nil }
+            guard count > 0, ContinuousClock.now < deadline else { return nil }
             request.append(contentsOf: buffer[..<count])
         }
         guard let end = request.range(of: lineEnd) else { return nil }
         return String(data: request[..<end.lowerBound], encoding: .utf8)
+    }
+
+    /// Make the next receive of the connection wait until the deadline at most. False when it has passed.
+    private static func limitReceive(of connection: Int32, to deadline: ContinuousClock.Instant) -> Bool {
+        let remaining = deadline - ContinuousClock.now
+        guard remaining > .zero else { return false }
+        let (seconds, attoseconds) = remaining.components
+        // A timeout of zero would make the receive wait without end.
+        let microseconds = max(1, seconds * 1_000_000 + attoseconds / 1_000_000_000_000)
+        var timeout = timeval(tv_sec: Int(microseconds / 1_000_000), tv_usec: Int32(microseconds % 1_000_000))
+        return setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0
     }
 
     private static func write(_ response: Data, to connection: Int32) {

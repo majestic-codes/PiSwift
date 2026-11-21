@@ -413,6 +413,52 @@ struct S79OAuthLoopbackCallbackTests {
     }
 
     @Test(.timeLimit(.minutes(1)), .enabled(if: s79HasIPv6Loopback))
+    func requestThatEndsAfterTheDeadlineOnIPv6LoopbackIsGivenUp() async throws {
+        let server = try await OAuthCallbackServer<String>.start(
+            providerName: "Example", port: 0, path: "/callback", redirectHost: "localhost", state: "state"
+        ) { _ in "" }
+        let port = try #require(URLComponents(string: await server.redirectUri())?.port.flatMap { UInt16(exactly: $0) })
+        let connection = try #require(s79ConnectToIPv6Loopback(port: port))
+        defer { Darwin.close(connection) }
+        let started = ContinuousClock.now
+
+        // The request line comes just before the deadline, the end of the headers just after it.
+        try await Task.sleep(for: .milliseconds(4500))
+        var line = Array("GET /callback?state=state&code=x HTTP/1.1\r\n".utf8)
+        _ = Darwin.send(connection, &line, line.count, 0)
+        try await Task.sleep(for: .milliseconds(1000))
+        var end = Array("\r\n".utf8)
+        _ = Darwin.send(connection, &end, end.count, 0)
+        #expect(s79IsClosedWithoutAnswer(connection))
+        #expect(ContinuousClock.now - started < .seconds(7))
+        await server.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)), .enabled(if: s79HasIPv6Loopback))
+    func closingTheServerEndsAnIPv6LoopbackConnectionThatWaitsForTheExchange() async throws {
+        let (exchangeStarted, startExchange) = AsyncStream<Void>.makeStream()
+        let (exchangeEnds, endExchange) = AsyncStream<Void>.makeStream()
+        defer { endExchange.finish() }
+        let server = try await OAuthCallbackServer<String>.start(
+            providerName: "Example", port: 0, path: "/callback", redirectHost: "localhost", state: "state"
+        ) { _ in
+            startExchange.yield()
+            for await _ in exchangeEnds {}
+            return "late"
+        }
+        let port = try #require(URLComponents(string: await server.redirectUri())?.port.flatMap { UInt16(exactly: $0) })
+        let connection = try #require(s79ConnectToIPv6Loopback(port: port))
+        defer { Darwin.close(connection) }
+        var request = Array("GET /callback?state=state&code=x HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8)
+        _ = Darwin.send(connection, &request, request.count, 0)
+        var started = exchangeStarted.makeAsyncIterator()
+        _ = await started.next()
+
+        await server.close()
+        #expect(s79IsClosedWithoutAnswer(connection))
+    }
+
+    @Test(.timeLimit(.minutes(1)), .enabled(if: s79HasIPv6Loopback))
     func portTakenOnIPv6LoopbackIsNotUsed() async throws {
         let port = try #require(s79FreePort())
         let foreign = try #require(s79ListenOnIPv6Loopback(port: port))
