@@ -69,7 +69,10 @@ struct A1AnthropicOAuthTests {
             #expect(bodies.first?["grant_type"] == "authorization_code")
             #expect(bodies.first?["code"] == "copied-code")
             #expect(bodies.first?["state"] == query.first { $0.name == "state" }?.value)
-            #expect(bodies.first?["code_verifier"] == query.first { $0.name == "state" }?.value)
+            // The state is a separate random value. The verifier is sent only in the token request.
+            let verifier = try #require(bodies.first?["code_verifier"])
+            #expect(verifier != query.first { $0.name == "state" }?.value)
+            #expect(!info.url.contains(verifier))
             #expect(bodies.first?["redirect_uri"] == "https://platform.claude.com/oauth/code/callback")
         }
     }

@@ -20,6 +20,11 @@ public enum OAuthCallbackMode: Sendable, Equatable {
     case chatGPT
 }
 
+/// A callback connection that waits for its HTTP response. The response closes the connection.
+struct OAuthCallbackPeer: Sendable {
+    let respond: @Sendable (Data) async -> Void
+}
+
 public actor OAuthCallbackServer<Value: Sendable> {
     private let listener: NWListener
     private let queue = DispatchQueue(label: "pi.oauth.callback")
@@ -36,6 +41,7 @@ public actor OAuthCallbackServer<Value: Sendable> {
     private var removeCancellationHandler: (@Sendable () -> Void)?
     private var connections: [NWConnection] = []
     private var boundPort: UInt16?
+    private var loopbackSocket: OAuthLoopbackSocket?
 
     private init(
         listener: NWListener, providerName: String, path: String, state: String?,
@@ -61,26 +67,41 @@ public actor OAuthCallbackServer<Value: Sendable> {
         try Task.checkCancellation()
         if signal?.isCancelled == true { throw OAuthCallbackFailure(message: "Login cancelled") }
         let nwPort = NWEndpoint.Port(rawValue: port) ?? .any
-        let parameters = NWParameters.tcp
-        parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(host), port: nwPort)
-        // A fixed port is already specified by requiredLocalEndpoint. Passing it
-        // again as `on:` causes NWError 22 on macOS.
-        let listener = port == 0
-            ? try NWListener(using: parameters, on: nwPort)
-            : try NWListener(using: parameters)
-        let server = OAuthCallbackServer(
-            listener: listener, providerName: providerName, path: path, state: state,
-            redirectHost: redirectHost ?? host, mode: mode, complete: complete
-        )
-        try await server.startListener()
-        if let signal {
-            let remove = signal.onCancel { Task { await server.abort() } }
-            await server.setCancellationHandler(remove)
+        // A redirect URI on `localhost` reaches 127.0.0.1 or ::1. The server holds the port on both,
+        // so no other local process receives the callback on ::1.
+        let holdsIPv6Loopback = oauthCallbackHoldsIPv6Loopback(host: host, redirectHost: redirectHost ?? host)
+        // A free port on 127.0.0.1 can be in use on ::1. Use another free port in that case.
+        var attempts = port == 0 && holdsIPv6Loopback ? 5 : 1
+        while true {
+            let parameters = NWParameters.tcp
+            parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(host), port: nwPort)
+            // A fixed port is already specified by requiredLocalEndpoint. Passing it
+            // again as `on:` causes NWError 22 on macOS.
+            let listener = port == 0
+                ? try NWListener(using: parameters, on: nwPort)
+                : try NWListener(using: parameters)
+            let server = OAuthCallbackServer(
+                listener: listener, providerName: providerName, path: path, state: state,
+                redirectHost: redirectHost ?? host, mode: mode, complete: complete
+            )
+            try await server.startListener()
+            do {
+                if holdsIPv6Loopback { try await server.holdIPv6Loopback() }
+            } catch {
+                await server.close()
+                attempts -= 1
+                if attempts > 0, (error as? NWError) == .posix(.EADDRINUSE) { continue }
+                throw error
+            }
+            if let signal {
+                let remove = signal.onCancel { Task { await server.abort() } }
+                await server.setCancellationHandler(remove)
+            }
+            if let timeoutMs {
+                await server.startTimeout(milliseconds: timeoutMs)
+            }
+            return server
         }
-        if let timeoutMs {
-            await server.startTimeout(milliseconds: timeoutMs)
-        }
-        return server
     }
 
     public func redirectUri() -> String {
@@ -118,6 +139,7 @@ public actor OAuthCallbackServer<Value: Sendable> {
     public func close() {
         finish(.failure(OAuthCallbackFailure(message: "OAuth callback server closed")))
         listener.cancel()
+        loopbackSocket = nil
         for connection in connections { connection.cancel() }
         connections.removeAll()
     }
@@ -201,6 +223,20 @@ public actor OAuthCallbackServer<Value: Sendable> {
 
     private func setBoundPort() { boundPort = listener.port?.rawValue }
 
+    private func holdIPv6Loopback() throws {
+        // Without a port there is nothing to hold, and the server must not run with ::1 open.
+        guard let boundPort, boundPort != 0 else {
+            throw OAuthCallbackFailure(message: "OAuth callback server has no port")
+        }
+        loopbackSocket = try OAuthLoopbackSocket.listen(port: boundPort) { [weak self] line, peer in
+            Task {
+                // The peer closes its connection only when it gets a response.
+                guard let self else { return await peer.respond(Data()) }
+                await self.process(line, connection: peer)
+            }
+        }
+    }
+
     private final class ConnectionState: Sendable {
         let buffer = LockedState(Data())
     }
@@ -221,7 +257,15 @@ public actor OAuthCallbackServer<Value: Sendable> {
                 }
             }
             if let requestLine {
-                Task { await self?.process(requestLine, connection: connection) }
+                let peer = OAuthCallbackPeer { response in
+                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                        connection.send(content: response, completion: .contentProcessed { _ in
+                            connection.cancel()
+                            continuation.resume()
+                        })
+                    }
+                }
+                Task { await self?.process(requestLine, connection: peer) }
             } else if isComplete {
                 connection.cancel()
             } else {
@@ -230,7 +274,7 @@ public actor OAuthCallbackServer<Value: Sendable> {
         }
     }
 
-    private func process(_ line: String, connection: NWConnection) async {
+    private func process(_ line: String, connection: OAuthCallbackPeer) async {
         let parts = line.split(separator: " ")
         let host = redirectHost.contains(":") ? "[\(redirectHost)]" : redirectHost
         guard parts.count >= 2, let boundPort,
@@ -291,7 +335,7 @@ public actor OAuthCallbackServer<Value: Sendable> {
         }
     }
 
-    private func send(_ connection: NWConnection, status: Int, html: String) async {
+    private func send(_ connection: OAuthCallbackPeer, status: Int, html: String) async {
         let body = Data(html.utf8)
         var headerLines = [
             "HTTP/1.1 \(status) \(status == 200 ? "OK" : "Error")",
@@ -301,13 +345,17 @@ public actor OAuthCallbackServer<Value: Sendable> {
         if mode == .standard { headerLines.append("Cache-Control: no-store") }
         headerLines.append(contentsOf: ["Connection: close", "", ""])
         let header = headerLines.joined(separator: "\r\n")
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            connection.send(content: Data(header.utf8) + body, completion: .contentProcessed { _ in
-                connection.cancel()
-                continuation.resume()
-            })
-        }
+        await connection.respond(Data(header.utf8) + body)
     }
+}
+
+/// Whether a callback server that listens on `host` also holds its port on `::1`.
+///
+/// A redirect URI on `localhost` reaches 127.0.0.1 or ::1. A listener on 127.0.0.1 or on the IPv4
+/// wildcard address answers only the first, so the server takes the port on ::1 as well.
+func oauthCallbackHoldsIPv6Loopback(host: String, redirectHost: String) -> Bool {
+    guard redirectHost.lowercased() == "localhost", let address = IPv4Address(host) else { return false }
+    return address.isLoopback || address == .any
 }
 
 /// Store a result if cancellation occurs before the continuation is installed.
