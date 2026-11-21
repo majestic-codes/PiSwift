@@ -308,13 +308,15 @@ public func oauthApiKey(provider: OAuthProvider, credentials: OAuthCredentials) 
 
 public func loginAnthropic(_ callbacks: OAuthLoginCallbacks, callbackPort: UInt16 = 53692) async throws -> OAuthCredentials {
     let pkce = try generatePKCE()
+    // The state is a random value of its own. The PKCE verifier goes only into the token request.
+    let state = generateOAuthState()
     let fallbackRedirectUri = "http://localhost:\(callbackPort)/callback"
     #if canImport(Network)
     let host = oauthCallbackHost()
     func startCallbackServer(port: UInt16) async throws -> OAuthCallbackServer<String> {
         try await OAuthCallbackServer<String>.start(
             providerName: "Anthropic", host: host, port: port, path: "/callback",
-            redirectHost: "localhost", state: pkce.verifier, signal: callbacks.signal
+            redirectHost: "localhost", state: state, signal: callbacks.signal
         ) { components in
             components.queryItems?.first { $0.name == "code" }?.value ?? ""
         }
@@ -334,7 +336,7 @@ public func loginAnthropic(_ callbacks: OAuthLoginCallbacks, callbackPort: UInt1
     #else
     let redirectUri = fallbackRedirectUri
     #endif
-    let authUrl = anthropicAuthorizeUrl(verifier: pkce.verifier, challenge: pkce.challenge, redirectUri: redirectUri)
+    let authUrl = anthropicAuthorizeUrl(state: state, challenge: pkce.challenge, redirectUri: redirectUri)
     await callbacks.onAuth(OAuthAuthInfo(
         url: authUrl,
         instructions: "Complete login in your browser. If the browser is on another machine, paste the final redirect URL here."
@@ -348,16 +350,13 @@ public func loginAnthropic(_ callbacks: OAuthLoginCallbacks, callbackPort: UInt1
     let result: OAuthCallbackOrManual<String> = .manual(try await callbacks.onPrompt(OAuthPrompt(message: "Complete login in your browser, or paste the authorization code / redirect URL here:", placeholder: redirectUri)))
     #endif
     let code: String
-    let state: String
     switch result {
     case .callback(let value):
         code = value
-        state = pkce.verifier
     case .manual(let input):
         let parsed = parseAuthorizationInput(input)
-        if let parsedState = parsed.state, parsedState != pkce.verifier { throw OAuthError.stateMismatch }
+        if let parsedState = parsed.state, parsedState != state { throw OAuthError.stateMismatch }
         code = parsed.code ?? ""
-        state = parsed.state ?? pkce.verifier
     }
     guard !code.isEmpty else { throw OAuthError.missingAuthorizationCode }
     if let onProgress = callbacks.onProgress { await onProgress("Exchanging authorization code for tokens...") }
@@ -389,9 +388,10 @@ public func loginAnthropicOAuth(_ callbacks: OAuthLoginCallbacks, callbackPort: 
 public func loginAnthropicCopyCode(_ callbacks: OAuthLoginCallbacks) async throws -> OAuthCredentials {
     try throwIfOAuthCancelled(callbacks.signal)
     let pkce = try generatePKCE()
+    let state = generateOAuthState()
     let redirectUri = "https://platform.claude.com/oauth/code/callback"
     await callbacks.onAuth(OAuthAuthInfo(
-        url: anthropicAuthorizeUrl(verifier: pkce.verifier, challenge: pkce.challenge, redirectUri: redirectUri),
+        url: anthropicAuthorizeUrl(state: state, challenge: pkce.challenge, redirectUri: redirectUri),
         instructions: "Complete login in your browser, then copy the code Anthropic shows and paste it here."
     ))
     let input = try await callbacks.onPrompt(OAuthPrompt(
@@ -399,11 +399,11 @@ public func loginAnthropicCopyCode(_ callbacks: OAuthLoginCallbacks) async throw
     ))
     try throwIfOAuthCancelled(callbacks.signal)
     let parsed = parseAuthorizationInput(input)
-    if let state = parsed.state, state != pkce.verifier { throw OAuthError.anthropicCopyCodeStateMismatch }
+    if let parsedState = parsed.state, parsedState != state { throw OAuthError.anthropicCopyCodeStateMismatch }
     guard let code = parsed.code, !code.isEmpty else { throw OAuthError.missingAuthorizationCode }
     if let onProgress = callbacks.onProgress { await onProgress("Exchanging authorization code for tokens...") }
     return try await exchangeAnthropicCode(
-        code: code, state: parsed.state ?? pkce.verifier, verifier: pkce.verifier,
+        code: code, state: state, verifier: pkce.verifier,
         redirectUri: redirectUri, signal: callbacks.signal
     )
 }
@@ -605,6 +605,11 @@ private func randomHex(count: Int) -> String {
     return bytes.map { String(format: "%02x", $0) }.joined()
 }
 
+/// A random OAuth state of 256 bits in base64url. It is not derived from the PKCE verifier.
+private func generateOAuthState() -> String {
+    base64UrlEncode(randomBytes(count: 32))
+}
+
 private func requiresProjectId(_ provider: OAuthProvider) -> Bool {
     provider == .googleGeminiCli || provider == .googleAntigravity
 }
@@ -617,7 +622,7 @@ private func anthropicClientId() -> String {
     return encoded
 }
 
-private func anthropicAuthorizeUrl(verifier: String, challenge: String, redirectUri: String) -> String {
+private func anthropicAuthorizeUrl(state: String, challenge: String, redirectUri: String) -> String {
     var components = URLComponents(string: "https://claude.ai/oauth/authorize")!
     components.queryItems = [
         URLQueryItem(name: "code", value: "true"),
@@ -627,7 +632,7 @@ private func anthropicAuthorizeUrl(verifier: String, challenge: String, redirect
         URLQueryItem(name: "scope", value: "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"),
         URLQueryItem(name: "code_challenge", value: challenge),
         URLQueryItem(name: "code_challenge_method", value: "S256"),
-        URLQueryItem(name: "state", value: verifier),
+        URLQueryItem(name: "state", value: state),
     ]
     return components.url?.absoluteString ?? "https://claude.ai/oauth/authorize"
 }
